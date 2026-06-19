@@ -1,0 +1,80 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── BNK CI 색 토큰 ───────────────────────────────────── */
+:root {
+  /* Dark theme (기본) */
+  --bnk-bg:           #161310;
+  --bnk-surface:      #211C18;
+  --bnk-surface-2:    #2A241F;
+  --bnk-border:       #332C26;
+  --bnk-text:         #F2EEE9;
+  --bnk-text-muted:   #A89F94;
+  --bnk-text-faint:   #6E655B;
+  --bnk-accent:       #D7191F;
+  --bnk-accent-hover: #8B0304;
+
+  /* 에이전트 상태색 (다크/라이트 공통) */
+  --state-done:       #3DA35D;
+  --state-running:    #E0A82E;
+  --state-pending:    #6E655B;
+  --state-degraded:   #C0561F;
+}
+
+[data-theme="light"] {
+  --bnk-bg:           #FAF8F5;
+  --bnk-surface:      #FFFFFF;
+  --bnk-surface-2:    #F4F0EB;
+  --bnk-border:       #E5DFD8;
+  --bnk-text:         #2A2522;
+  --bnk-text-muted:   #655C4F;
+  --bnk-text-faint:   #909394;
+  --bnk-accent:       #D7191F;
+  --bnk-accent-hover: #8B0304;
+}
+
+@layer base {
+  body {
+    background-color: var(--bnk-bg);
+    color: var(--bnk-text);
+    font-family: 'Pretendard', system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  ::-webkit-scrollbar { width: 4px; height: 4px; }
+  ::-webkit-scrollbar-track { background: var(--bnk-surface); }
+  ::-webkit-scrollbar-thumb { background: var(--bnk-border); border-radius: 2px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--bnk-text-faint); }
+}
+
+@layer utilities {
+  /* 플랫 카드 — 블러/백드롭 제거, 단색 배경 + 얇은 테두리 */
+  .glass {
+    background: var(--bnk-surface-2);
+    border: 0.5px solid var(--bnk-border);
+  }
+  .glass-dark {
+    background: var(--bnk-surface);
+    border: 0.5px solid var(--bnk-border);
+  }
+
+  /* 커서 타이핑 애니메이션 */
+  .typing-cursor::after {
+    content: '|';
+    animation: blink 0.7s step-end infinite;
+    color: var(--bnk-accent);
+  }
+
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+  /* 에이전트 아이콘 회전 (running 상태) */
+  @keyframes spin-slow { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  .spin-slow { animation: spin-slow 1.2s linear infinite; }
+
+  /* running 상태 골드 펄스 */
+  @keyframes running-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+  }
+  .pulse-running { animation: running-pulse 1.4s ease-in-out infinite; }
+}
