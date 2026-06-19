@@ -1,0 +1,16 @@
+.env
+.env.local
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+.vscode/
+.idea/
+*.egg-info/
+dist/
+build/
+.DS_Store
+*.log
+.streamlit/
