@@ -1,8 +1,10 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from foundry_client import FoundryClient
+from report_docx import build_report_docx
 import os
+from urllib.parse import quote
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,6 +26,9 @@ try:
 except ValueError as e:
     print(f"Warning: Foundry client initialization failed: {e}")
     foundry_client = None
+
+# 서버사이드 DOCX 캐시 (case_id -> bytes) — Responses API가 생성한 파일 임시 보관
+_docx_cache: dict = {}
 
 
 class IncidentReport(BaseModel):
@@ -86,7 +91,50 @@ def analyze_incident(report: IncidentReport):
         }
         raise HTTPException(status_code=500, detail=detail)
 
+    # Responses API가 생성한 DOCX bytes를 서버 캐시에 보관하고 response에서 제거
+    rw = response.get("report_writer", {})
+    docx_bytes_from_agent = rw.pop("_docx_bytes", None)
+    docx_filename_from_agent = rw.pop("_docx_filename", None)
+    case_id = response.get("case_id", "")
+    if docx_bytes_from_agent and case_id:
+        _docx_cache[case_id] = {
+            "bytes": docx_bytes_from_agent,
+            "filename": docx_filename_from_agent or f"EFARS_보고서_초안_{case_id}.docx",
+        }
+        print(f"[DOCX_CACHE] Stored {len(docx_bytes_from_agent)} bytes for case_id={case_id}", flush=True)
+
     return ReportResponse(status="success", data=response)
+
+
+@app.post("/report/docx")
+def export_report_docx(payload: dict = Body(...)):
+    """
+    분석 결과(data)를 받아 EFARS 보고서 .docx 바이트를 반환한다.
+    body 는 /analyze 응답 전체({"status","data"}) 또는 data 딕셔너리 자체 모두 허용.
+    """
+    data = payload.get("data", payload) if isinstance(payload, dict) else None
+    if not isinstance(data, dict) or not data:
+        raise HTTPException(status_code=400, detail="analysis data is empty")
+
+    case_id = data.get("case_id", "report")
+
+    # 서버 캐시에 Responses API 생성 DOCX가 있으면 우선 사용
+    cached = _docx_cache.get(case_id)
+    if cached:
+        docx_bytes = cached["bytes"]
+        filename = quote(cached["filename"])
+        print(f"[DOCX_CACHE] Serving cached DOCX for case_id={case_id}", flush=True)
+    else:
+        try:
+            docx_bytes = build_report_docx(data)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"docx render failed: {e}")
+        filename = quote(f"EFARS_보고서_초안_{case_id}.docx")
+    return Response(
+        content=docx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
 
 
 @app.get("/agents/status")

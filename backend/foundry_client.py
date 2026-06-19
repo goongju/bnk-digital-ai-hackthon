@@ -7,7 +7,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from dotenv import load_dotenv
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 
 load_dotenv()
 
@@ -20,6 +20,7 @@ class FoundryClient:
         self.api_key = os.getenv("FOUNDRY_API_KEY")
         self.model_deployment = os.getenv("FOUNDRY_MODEL_DEPLOYMENT")
         self.project_name = os.getenv("FOUNDRY_PROJECT_NAME")
+        self.project_endpoint = os.getenv("FOUNDRY_PROJECT_ENDPOINT")
         self.incident_classifier_id = os.getenv("INCIDENT_CLASSIFIER_ID")
         self.regulation_search_id = os.getenv("REGULATION_SEARCH_ID")
         self.deadline_manager_id = os.getenv("DEADLINE_MANAGER_ID")
@@ -37,6 +38,157 @@ class FoundryClient:
             self.quality_supervisor_id,
         ]):
             raise ValueError("Missing required Foundry configuration in .env")
+
+        # Lazy-loaded Foundry project client (requires azure-ai-projects + azure-identity)
+        self._project_client = None
+        self._openai_client = None
+
+    def _get_openai_client(self):
+        """Foundry project OpenAI client를 lazy-load (azure-ai-projects 필요)."""
+        if self._openai_client is not None:
+            return self._openai_client
+        if not self.project_endpoint:
+            return None
+        try:
+            from azure.ai.projects import AIProjectClient
+            from azure.identity import DefaultAzureCredential
+            if self._project_client is None:
+                self._project_client = AIProjectClient(
+                    endpoint=self.project_endpoint,
+                    credential=DefaultAzureCredential(),
+                )
+            self._openai_client = self._project_client.get_openai_client()
+            return self._openai_client
+        except Exception as e:
+            print(f"[WARN] Could not create Foundry project client: {e}", flush=True)
+            return None
+
+    # report-writer 에이전트에서 가져온 code_interpreter 파일 ID (DOCX 템플릿)
+    _REPORT_WRITER_CI_FILE_ID = "assistant-1hXmDPrB9uaSuQ8FPjX8n3"
+    _REPORT_WRITER_CI_AGENT_NAME = "report-writer-ci-only"
+
+    def _invoke_writer_via_responses_api(
+        self,
+        payload_text: str,
+        timeout_sec: int = 120,
+    ) -> Tuple[bool, Optional[bytes], str]:
+        """
+        Foundry Responses API + Code Interpreter(code_interpreter only, no MCP)로 report-writer를 호출.
+        성공 시 (True, docx_bytes, filename), 실패 시 (False, None, error_message) 반환.
+        """
+        oc = self._get_openai_client()
+        if oc is None:
+            return False, None, "Foundry project client unavailable"
+        if self._project_client is None:
+            return False, None, "Foundry project client not initialized"
+
+        try:
+            from azure.ai.projects.models import PromptAgentDefinition, CodeInterpreterTool, AutoCodeInterpreterToolParam
+
+            # 원본 report-writer instructions 가져오기 (캐시)
+            agent_def = self._project_client.agents.get("report-writer")
+            versions = agent_def.get("versions", {})
+            latest = versions.get("latest", {})
+            defn = latest.get("definition", {})
+            instructions = defn.instructions
+            model = defn.model or self.model_deployment
+
+            # MCP 없이 code_interpreter만 사용하는 임시 에이전트 버전 생성
+            temp_agent = self._project_client.agents.create_version(
+                agent_name=self._REPORT_WRITER_CI_AGENT_NAME,
+                definition=PromptAgentDefinition(
+                    model=model,
+                    instructions=instructions,
+                    tools=[
+                        CodeInterpreterTool(
+                            container=AutoCodeInterpreterToolParam(
+                                file_ids=[self._REPORT_WRITER_CI_FILE_ID]
+                            )
+                        )
+                    ],
+                ),
+                description="Temp: code_interpreter only (no MCP) for backend use",
+            )
+            print(f"[RESPONSES_API] temp agent: {temp_agent.name} v{temp_agent.version}", flush=True)
+
+            try:
+                # conversation 생성
+                conversation = oc.conversations.create()
+                conv_id = conversation.id
+                print(f"[RESPONSES_API] conversation_id={conv_id}", flush=True)
+
+                # report-writer-ci-only 에이전트 호출
+                response = oc.responses.create(
+                    conversation=conv_id,
+                    input=payload_text,
+                    max_output_tokens=8192,
+                    extra_body={
+                        "agent_reference": {
+                            "name": self._REPORT_WRITER_CI_AGENT_NAME,
+                            "type": "agent_reference",
+                        }
+                    },
+                    timeout=timeout_sec,
+                )
+                print(f"[RESPONSES_API] response status={response.status} incomplete_details={getattr(response,'incomplete_details',None)}", flush=True)
+                print(f"[RESPONSES_API] output items count: {len(response.output)}", flush=True)
+                for _i, _item in enumerate(response.output):
+                    print(f"[RESPONSES_API]   output[{_i}] type={_item.type}", flush=True)
+                    if hasattr(_item, "content"):
+                        for _j, _cb in enumerate(getattr(_item, "content", []) or []):
+                            anns = getattr(_cb, "annotations", []) or []
+                            print(f"[RESPONSES_API]     content[{_j}] type={getattr(_cb,'type','')} annotations={len(anns)}", flush=True)
+                            for _ann in anns:
+                                print(f"[RESPONSES_API]       annotation type={getattr(_ann,'type','')} filename={getattr(_ann,'filename','')}", flush=True)
+
+                # 출력에서 .docx 파일 annotation 찾기 — status 무관하게 스캔
+                file_id = None
+                filename = None
+                container_id = None
+
+                for item in response.output:
+                    # message 타입 이외에도 tool_result 등 확인
+                    content_list = getattr(item, "content", None) or []
+                    for content_block in content_list:
+                        for annotation in getattr(content_block, "annotations", []) or []:
+                            if getattr(annotation, "type", "") == "container_file_citation":
+                                fn = getattr(annotation, "filename", "")
+                                if fn.endswith(".docx"):
+                                    file_id = annotation.file_id
+                                    filename = fn
+                                    container_id = annotation.container_id
+                                    break
+                        if file_id:
+                            break
+                    if file_id:
+                        break
+
+                if not file_id or not container_id:
+                    print("[RESPONSES_API] No .docx annotation found in response", flush=True)
+                    return False, None, "No .docx file annotation in agent response"
+
+                print(f"[RESPONSES_API] Found file: {filename} (id={file_id})", flush=True)
+                file_content = oc.containers.files.content.retrieve(
+                    file_id=file_id,
+                    container_id=container_id,
+                )
+                docx_bytes = file_content.read()
+                print(f"[RESPONSES_API] Downloaded {len(docx_bytes)} bytes", flush=True)
+                return True, docx_bytes, filename or "report.docx"
+
+            finally:
+                # 임시 에이전트 버전 정리 (오류 무시)
+                try:
+                    self._project_client.agents.delete_version(
+                        agent_name=temp_agent.name,
+                        agent_version=temp_agent.version,
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"[RESPONSES_API] error: {e}", flush=True)
+            return False, None, str(e)
 
     def _post_chat(self, messages: List[Dict[str, str]], timeout_sec: int = 20) -> Dict[str, Any]:
         headers = {
@@ -542,6 +694,27 @@ class FoundryClient:
                 writer_data = writer_data2
 
         writer_data = self._apply_writer_defaults(writer_data)
+
+        # --- Foundry Responses API로 report-writer 직접 호출하여 DOCX 생성 ---
+        _t_docx = time.time()
+        docx_ok, docx_bytes, docx_info = self._invoke_writer_via_responses_api(
+            payload_text=(
+                f"case_id: {case_id}\n"
+                f"user_facts: {user_facts}\n"
+                f"classification: {json.dumps(classification, ensure_ascii=False)}\n"
+                f"regulations: {json.dumps(regulations, ensure_ascii=False)}\n"
+                f"timeline: {json.dumps(timeline, ensure_ascii=False)}\n"
+                f"partial_results: {str(partial_results).lower()}\n"
+                f"degraded_components: {json.dumps(degraded_components, ensure_ascii=False)}"
+            ),
+            timeout_sec=120,
+        )
+        print(f"[TIMER] responses_api docx: {time.time()-_t_docx:.1f}s  ok={docx_ok}", flush=True)
+        if docx_ok:
+            writer_data["_docx_bytes"] = docx_bytes
+            writer_data["_docx_filename"] = docx_info
+        # -----------------------------------------------------------------------
+
         print(f"[TIMER] total orchestration: {time.time()-_t_start:.1f}s", flush=True)
 
         final_message = self._format_final_message(

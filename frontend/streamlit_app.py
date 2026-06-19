@@ -16,6 +16,23 @@ if "selected_agent" not in st.session_state:
     st.session_state.selected_agent = None
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_report_docx(case_id: str, payload_json: str) -> bytes | None:
+    """백엔드 /report/docx 에서 보고서 docx 바이트를 받아온다. case_id 기준 캐시."""
+    try:
+        resp = requests.post(
+            f"{BACKEND_URL}/report/docx",
+            data=payload_json.encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            return resp.content
+    except Exception:
+        return None
+    return None
+
+
 @st.cache_data(ttl=5)
 def check_backend_health() -> bool:
     try:
@@ -342,10 +359,6 @@ else:
 
                 st.markdown("<br>", unsafe_allow_html=True)
 
-                # 보완 필요 항목
-                if missing:
-                    st.warning(f"보완 필요 항목: {', '.join(missing)}")
-
                 # degraded
                 degraded = data.get("degraded_components", [])
                 if degraded:
@@ -403,9 +416,6 @@ else:
 </div>""", unsafe_allow_html=True)
 
                         missing_cls = cls.get("missing_fields", [])
-                        if missing_cls:
-                            st.markdown("<br>", unsafe_allow_html=True)
-                            st.warning(f"누락 필드: {', '.join(missing_cls)}")
 
             # ── 탭 2: 적용 규정 ─────────────────────────────────────────
             with tabs[2]:
@@ -499,12 +509,33 @@ background:#0a1125;border:1px solid #1e2e50;border-left:4px solid {color};border
                 st.json(data)
 
             json_str = json.dumps(data, ensure_ascii=False, indent=2)
-            st.download_button(
-                label="JSON 결과 다운로드",
-                data=json_str,
-                file_name=f"efars_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json",
-            )
+            dl_col1, dl_col2 = st.columns(2)
+            with dl_col1:
+                docx_bytes = fetch_report_docx(
+                    data.get("case_id", ""), json.dumps(data, ensure_ascii=False)
+                )
+                if docx_bytes:
+                    st.download_button(
+                        label="📄 보고서 DOCX 다운로드",
+                        data=docx_bytes,
+                        file_name=f"EFARS_보고서_초안_{data.get('case_id', 'report')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True,
+                    )
+                else:
+                    st.button(
+                        "📄 보고서 DOCX 다운로드 (생성 실패)",
+                        disabled=True,
+                        use_container_width=True,
+                    )
+            with dl_col2:
+                st.download_button(
+                    label="JSON 결과 다운로드",
+                    data=json_str,
+                    file_name=f"efars_result_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json",
+                    use_container_width=True,
+                )
         
         # 에이전트가 선택된 경우: 해당 에이전트의 입출력만 표시
         else:
